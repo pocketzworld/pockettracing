@@ -2,37 +2,80 @@
 
 from __future__ import annotations
 
-from asyncio import sleep
 from contextlib import contextmanager
 from contextvars import ContextVar
 from itertools import count
 from random import random
 from secrets import token_hex
 from time import perf_counter, time
-from typing import Any, Final, Iterator, Mapping, NoReturn
+from typing import Iterator, Mapping, Protocol, Dict, Union, TYPE_CHECKING
 
-from aiohttp import ClientSession
-from attrs import Factory, define
-from orjson import dumps
+if TYPE_CHECKING:
+    from typing_extensions import TypeAlias
 
-HONEYCOMB_URL: Final = "https://api.honeycomb.io"
+_ELEMENT: TypeAlias = Dict[str, Union[str, float]]
 
 _trace_cnt = count().__next__
 _span_cnt = count().__next__
 
 
-@define
+class BufferProtocol(Protocol):
+    size_limit: int | None
+
+    def append(self, item: _ELEMENT) -> None:
+        ...
+
+    def drain(self) -> list[_ELEMENT]:
+        ...
+
+
+class _ListBuffer:
+    _data: list[_ELEMENT]
+    size_limit: int | None
+
+    def __init__(self, size_limit: int | None = None):
+        self.size_limit = size_limit
+        self._data = []
+
+    def append(self, item: _ELEMENT):
+        if self.size_limit is None or len(self._data) <= self.size_limit:
+            self._data.append(item)
+
+    def drain(self) -> list[_ELEMENT]:
+        res = self._data
+        self._data = []
+        return res
+
+
 class Tracer:
     """A tracer for generating traces to be sent to a tracing service."""
 
-    metadata: dict[str, str] = {}  # Should contain service.name.
-    trace_prefix: str = Factory(lambda: token_hex(8))
-    buffer_len: int = 1000
-    trace_chance: float | None = None
-    _buffer: list[dict] = Factory(list)
-    _active_trace_and_span: ContextVar[tuple[str, str] | None] = Factory(
-        lambda: ContextVar("active", default=None)
-    )
+    metadata: dict[str, str]
+    trace_prefix: str
+    trace_chance: float | None
+    _buffer: BufferProtocol
+    _active_trace_and_span: ContextVar[tuple[str, str] | None]
+
+    def __init__(
+        self,
+        metadata: dict[str, str] | None,
+        trace_prefix: str | None = None,
+        buffer_len: int = 1000,
+        trace_chance: float | None = None,
+    ):
+        self.metadata = {} if metadata is None else metadata
+        self.trace_prefix = token_hex(8) if trace_prefix is None else trace_prefix
+        self._buffer = _ListBuffer(buffer_len)
+        self.trace_chance = trace_chance
+        self._active_trace_and_span = ContextVar("active", default=None)
+
+    @property
+    def buffer_len(self) -> int | None:
+        return self._buffer.size_limit
+
+    @buffer_len.setter
+    def buffer_len(self, value: int | None):
+        self._buffer.size_limit = value
 
     @contextmanager
     def trace(self, name: str, **kwargs: str) -> Iterator[dict[str, str]]:
@@ -52,17 +95,14 @@ class Tracer:
             raise
         finally:
             duration = perf_counter() - duration_start
-            self._append_to_buffer(
-                self.metadata
-                | {
-                    "name": name,
-                    "time": start,
-                    "duration_ms": duration * 1000,
-                    "trace.trace_id": trace_id,
-                    "trace.span_id": span_id,
-                }
-                | trace_metadata
-            )
+            data: _ELEMENT = {
+                "name": name,
+                "time": start,
+                "duration_ms": duration * 1000,
+                "trace.trace_id": trace_id,
+                "trace.span_id": span_id,
+            }
+            self._buffer.append(self.metadata | data | trace_metadata)
 
     @contextmanager
     def span(
@@ -86,18 +126,15 @@ class Tracer:
             raise
         finally:
             duration = perf_counter() - duration_start
-            self._append_to_buffer(
-                self.metadata
-                | {
-                    "name": name,
-                    "time": start,
-                    "duration_ms": duration * 1000,
-                    "trace.trace_id": trace_id,
-                    "trace.span_id": span_id,
-                    "trace.parent_id": parent_span_id,
-                }
-                | span_metadata
-            )
+            data: _ELEMENT = {
+                "name": name,
+                "time": start,
+                "duration_ms": duration * 1000,
+                "trace.trace_id": trace_id,
+                "trace.span_id": span_id,
+                "trace.parent_id": parent_span_id,
+            }
+            self._buffer.append(self.metadata | data | span_metadata)
             self._active_trace_and_span.reset(token)
 
     @contextmanager
@@ -112,30 +149,9 @@ class Tracer:
         with self.span(name, (trace_id, parent_id), **kwargs) as span_metadata:
             yield span_metadata
 
+    def drain_buffer(self) -> list[_ELEMENT]:
+        return self._buffer.drain()
+
     def span_to_dict(self) -> dict[str, str]:
         parent = self._active_trace_and_span.get()
         return {} if parent is None else {"_trace": ",".join(parent)}
-
-    def drain_buffer(self) -> list[dict[str, str | float]]:
-        buf = self._buffer
-        self._buffer = []
-        return buf
-
-    def _append_to_buffer(self, val: dict[str, Any]) -> None:
-        if len(self._buffer) <= self.buffer_len:
-            self._buffer.append(val)
-
-
-async def send_to_honeycomb(
-    tracer: Tracer, http_client: ClientSession, api_key: str, dataset: str
-) -> NoReturn:
-    url = f"{HONEYCOMB_URL}/1/batch/{dataset}"
-    while True:
-        while buf := tracer.drain_buffer():
-            # HC expects a string value under "time"
-            payload = dumps([{"data": e, "time": str(e.pop("time"))} for e in buf])
-            resp = await http_client.post(
-                url, data=payload, headers={"X-Honeycomb-Team": api_key}
-            )
-            resp.raise_for_status()
-        await sleep(5)
